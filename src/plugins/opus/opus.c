@@ -22,7 +22,7 @@
 
 #include <glib.h>
 
-#include "opusfile/opusfile.h"
+#include <opusfile.h>
 
 #include "xmms/xmms_xformplugin.h"
 #include "xmms/xmms_sample.h"
