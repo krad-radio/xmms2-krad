@@ -19,18 +19,21 @@
 #ifndef __ENCODE_H
 #define __ENCODE_H
 
+#include "xmms/xmms_outputplugin.h"
+
 #include <glib.h>
 #include <ogg/ogg.h>
-#include <vorbis/codec.h>
+#include <opus.h>
 
 #include "xmms/xmms_sample.h"
 
 typedef struct encoder_state encoder_state;
 
-encoder_state *xmms_ices_encoder_init(int min_br, int nom_br, int max_br);
+gboolean xmms_ices_encoder_create (encoder_state *s);
+encoder_state *xmms_ices_encoder_init(int bitrate);
 void xmms_ices_encoder_fini(encoder_state *s);
-gboolean xmms_ices_encoder_stream_change(encoder_state *s, int rate,
-                                         int channels, vorbis_comment *vc);
+//gboolean xmms_ices_encoder_stream_change(encoder_state *s, int rate,
+//                                         int channels, vorbis_comment *vc);
 void xmms_ices_encoder_input(encoder_state *s, xmms_samplefloat_t *buf, int n_samples);
 void xmms_ices_encoder_finish(encoder_state *s);
 gboolean xmms_ices_encoder_output(encoder_state *s, ogg_page *og);

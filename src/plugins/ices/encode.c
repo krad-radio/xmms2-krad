@@ -23,8 +23,7 @@
 #include <glib.h>
 
 #include <ogg/ogg.h>
-#include <vorbis/codec.h>
-#include <vorbis/vorbisenc.h>
+#include <opus.h>
 
 #include "encode.h"
 #include "xmms/xmms_log.h"
@@ -32,14 +31,24 @@
 
 #define MODULE "encode/"
 
+typedef struct {
+   int version;
+   int channels; /* Number of channels: 1..255 */
+   int preskip;
+   ogg_uint32_t input_sample_rate;
+   int gain; /* in dB S7.8 should be zero whenever possible */
+   int channel_mapping;
+   /* The rest is only used if channel_mapping != 0 */
+   int nb_streams;
+   int nb_coupled;
+   unsigned char stream_map[255];
+} OpusHeader;
+
 struct encoder_state {
 	/* General encoder configuration. */
-	int min_br;
-	int nom_br;
-	int max_br;
-	int channels;
-	int rate;
-
+	int bitrate;
+	int last_bitrate;
+	
 	gboolean encoder_inited;
 
 	/* Ogg state. Remains active for the lifetime of the encoder. */
@@ -55,45 +64,207 @@ struct encoder_state {
 	int samples_in_current_page;
 	ogg_int64_t previous_granulepos;
 
-	/* Vorbis state. May be recreated if there is a change in
-	 * rate/channels. */
-	vorbis_info vi;
-	vorbis_block vb;
-	vorbis_dsp_state vd;
+	/* Opus state. */
+    OpusEncoder *encoder;
+	OpusHeader *header;
+	unsigned char *header_data;
+	unsigned char *tags;
+	int tags_size;
+	int header_size;
+	
+	int packetno;
+	int granulepos;
+	
+	unsigned char *buffer;	
+	ogg_packet op;
+	
+	unsigned char sbuffer[4096 * 8];
+	int sbuffer_pos;
+	int sbuffer_samples;
 };
 
+typedef struct {
+   unsigned char *data;
+   int maxlen;
+   int pos;
+} Packet;
+
+typedef struct {
+   const unsigned char *data;
+   int maxlen;
+   int pos;
+} ROPacket;
+
+static int opus_header_to_packet(const OpusHeader *h, unsigned char *packet, int len);
+
+static int write_uint32(Packet *p, ogg_uint32_t val)
+{
+   if (p->pos>p->maxlen-4)
+      return 0;
+   p->data[p->pos  ] = (val    ) & 0xFF;
+   p->data[p->pos+1] = (val>> 8) & 0xFF;
+   p->data[p->pos+2] = (val>>16) & 0xFF;
+   p->data[p->pos+3] = (val>>24) & 0xFF;
+   p->pos += 4;
+   return 1;
+}
+
+static int write_uint16(Packet *p, ogg_uint16_t val)
+{
+   if (p->pos>p->maxlen-2)
+      return 0;
+   p->data[p->pos  ] = (val    ) & 0xFF;
+   p->data[p->pos+1] = (val>> 8) & 0xFF;
+   p->pos += 2;
+   return 1;
+}
+
+static int write_chars(Packet *p, const unsigned char *str, int nb_chars)
+{
+   int i;
+   if (p->pos>p->maxlen-nb_chars)
+      return 0;
+   for (i=0;i<nb_chars;i++)
+      p->data[p->pos++] = str[i];
+   return 1;
+}
+
+int opus_header_to_packet(const OpusHeader *h, unsigned char *packet, int len)
+{
+   int i;
+   Packet p;
+   unsigned char ch;
+
+   p.data = packet;
+   p.maxlen = len;
+   p.pos = 0;
+   if (len<19)return 0;
+   if (!write_chars(&p, (const unsigned char*)"OpusHead", 8))
+      return 0;
+   /* Version is 1 */
+   ch = 1;
+   if (!write_chars(&p, &ch, 1))
+      return 0;
+
+   ch = h->channels;
+   if (!write_chars(&p, &ch, 1))
+      return 0;
+
+   if (!write_uint16(&p, h->preskip))
+      return 0;
+
+   if (!write_uint32(&p, h->input_sample_rate))
+      return 0;
+
+   if (!write_uint16(&p, h->gain))
+      return 0;
+
+   ch = h->channel_mapping;
+   if (!write_chars(&p, &ch, 1))
+      return 0;
+
+   if (h->channel_mapping != 0)
+   {
+      ch = h->nb_streams;
+      if (!write_chars(&p, &ch, 1))
+         return 0;
+
+      ch = h->nb_coupled;
+      if (!write_chars(&p, &ch, 1))
+         return 0;
+
+      /* Multi-stream support */
+      for (i=0;i<h->channels;i++)
+      {
+         if (!write_chars(&p, &h->stream_map[i], 1))
+            return 0;
+      }
+   }
+
+   return p.pos;
+}
 
 /* Create an ogg stream and vorbis encoder, with the configuration
  * specified in the encoder_state.
  */
-static gboolean
-xmms_ices_encoder_create (encoder_state *s, vorbis_comment *vc)
+gboolean
+xmms_ices_encoder_create (encoder_state *s)
 {
-	ogg_packet header[3];
+    int err;	
+	ogg_packet op;
 
 	if (s->encoder_inited) {
 		XMMS_DBG ("OOPS: xmms_ices_encoder_create called "
 		          "with s->encoder_inited == TRUE !");
 	}
 
-	XMMS_DBG ("Creating encoder in ABR mode: min/avg/max bitrate %d/%d/%d",
-	          s->min_br, s->nom_br, s->max_br);
+	/* Create the Opus encoder and headers. */
 
-	/* Create the Vorbis encoder. */
-	vorbis_info_init (&s->vi);
-	if (vorbis_encode_init (&s->vi, s->channels, s->rate,
-	                        s->max_br, s->nom_br, s->min_br) < 0)
+	err = 0;
+	s->header = (OpusHeader *)calloc(1, sizeof(OpusHeader));
+	s->header_data = (unsigned char *)calloc (1, 1024);	
+	s->tags = (unsigned char *)calloc (1, 1024);
+	s->buffer = (unsigned char *)calloc (1, 4 * 4096);
+	s->header->gain = 0;
+	s->header->channels = 2;
+	s->header->input_sample_rate = 48000;
+	s->encoder = opus_encoder_create (48000, 2, OPUS_APPLICATION_AUDIO, &err);
+	opus_encoder_ctl (s->encoder, OPUS_SET_BITRATE(s->bitrate));
+	if (s->encoder == NULL) {
+		printf("Opus Encoder creation error: %s\n", opus_strerror (err));
+		free (s->header_data);
+		free (s->header);
+		free (s->tags);
+		free (s->buffer);
 		return FALSE;
-	vorbis_analysis_init (&s->vd, &s->vi);
-	vorbis_block_init (&s->vd, &s->vb);
+	}
+	s->last_bitrate = s->bitrate;
+	opus_encoder_ctl (s->encoder, OPUS_GET_LOOKAHEAD (&s->header->preskip));
+	s->header_size = opus_header_to_packet (s->header, s->header_data, 100);
 
-	/* Initialize the ogg stream and input the vorbis header
+	s->tags_size = 
+	8 + 4 + strlen (opus_get_version_string ()) + 4 + 4 + strlen ("ENCODER=") + strlen (XMMS_VERSION);
+	
+	memcpy (s->tags, "OpusTags", 8);
+	
+	s->tags[8] = strlen (opus_get_version_string ());
+	
+	memcpy (s->tags + 12, opus_get_version_string (), strlen (opus_get_version_string ()));
+
+	s->tags[12 + strlen (opus_get_version_string ())] = 1;
+
+	s->tags[12 + strlen (opus_get_version_string ()) + 4] = strlen ("ENCODER=") + strlen (XMMS_VERSION);
+	
+	memcpy (s->tags + 12 + strlen (opus_get_version_string ()) + 4 + 4, "ENCODER=", strlen ("ENCODER="));
+	
+	memcpy (s->tags + 12 + strlen (opus_get_version_string ()) + 4 + 4 + strlen ("ENCODER="),
+			XMMS_VERSION,
+			strlen (XMMS_VERSION));	
+
+	/* Initialize the ogg stream and input the Opus header
 	 * packets. */
 	ogg_stream_init (&s->os, s->serial++);
-	vorbis_analysis_headerout (&s->vd, vc, &header[0], &header[1], &header[2]);
-	ogg_stream_packetin (&s->os, &header[0]);
-	ogg_stream_packetin (&s->os, &header[1]);
-	ogg_stream_packetin (&s->os, &header[2]);
+
+	s->packetno = 0;
+	s->granulepos = 0;
+	
+	op.b_o_s = 1;
+	op.e_o_s = 0;
+	op.granulepos = 0;
+	op.packetno = s->packetno++;
+	op.packet = s->header_data;
+	op.bytes = s->header_size;
+
+	ogg_stream_packetin (&s->os, &op);
+	
+	op.b_o_s = 0;
+	op.e_o_s = 0;
+	op.granulepos = 0;
+	op.packetno = s->packetno++;
+	op.packet = s->tags;
+	op.bytes = s->tags_size;
+
+	ogg_stream_packetin (&s->os, &op);
 
 	s->in_header = TRUE;
 	s->flushing = FALSE;
@@ -112,29 +283,30 @@ xmms_ices_encoder_free (encoder_state *s)
 {
 	if (s->encoder_inited) {
 		ogg_stream_clear (&s->os);
-		vorbis_block_clear (&s->vb);
-		vorbis_dsp_clear (&s->vd);
-		vorbis_info_clear (&s->vi);
+		opus_encoder_destroy (s->encoder);
+		free (s->header_data);
+		free (s->header);
+		free (s->tags);
+		free (s->buffer);
 		s->encoder_inited = FALSE;
 	}
 }
 
 
 encoder_state *
-xmms_ices_encoder_init (int min_br, int nom_br, int max_br)
+xmms_ices_encoder_init (int bitrate)
 {
 	encoder_state *s;
 
-	/* If none of these are set, it's obviously not supposed to be managed */
-	if (nom_br <= 0)
-		return NULL;
-
 	s = g_new0 (encoder_state, 1);
 
-	s->min_br = min_br;
-	s->nom_br = nom_br;
-	s->max_br = max_br;
-	s->serial = 0;
+	if ((bitrate < 9600) || (bitrate > 320000)) {
+		s->bitrate = 132000;
+	} else {
+		s->bitrate = bitrate;
+	}
+
+	s->serial = 66631337;
 	s->in_header = FALSE;
 	s->encoder_inited = FALSE;
 
@@ -146,7 +318,7 @@ void xmms_ices_encoder_fini (encoder_state *s) {
 	g_free (s);
 }
 
-/* Start a new logical ogg stream. */
+/* Start a new logical ogg stream.
 gboolean xmms_ices_encoder_stream_change (encoder_state *s, int rate,
                                           int channels, vorbis_comment *vc)
 {
@@ -155,22 +327,45 @@ gboolean xmms_ices_encoder_stream_change (encoder_state *s, int rate,
 	s->channels = channels;
 	return xmms_ices_encoder_create (s, vc);
 }
-
-/* Encode the given data into Ogg Vorbis. */
+*/
+/* Encode the given data into Ogg Opus. */
 void xmms_ices_encoder_input (encoder_state *s, xmms_samplefloat_t *buf, int bytes)
 {
-	float **buffer;
-	int i,j;
-	int channels = s->vi.channels;
-	int samples = bytes / (sizeof (xmms_samplefloat_t)*channels);
+	int ret;
+	int samples = bytes / (sizeof (xmms_samplefloat_t)*2);
+	int bytes_per_opus_frame;
+	int samples_per_opus_frame;
+	ret = 0;
+	samples_per_opus_frame = 960;
+	bytes_per_opus_frame = samples_per_opus_frame * sizeof (xmms_samplefloat_t)*2;
+	
+	memcpy (s->sbuffer + s->sbuffer_pos, buf, bytes);
+	s->sbuffer_pos += bytes;
+	s->sbuffer_samples += samples;
+	
+	if (s->sbuffer_samples >= samples_per_opus_frame) {
+		ret = opus_encode_float (s->encoder, (float *)s->sbuffer, samples_per_opus_frame, s->buffer, 2048 * 4);
+		//printf("Opus Encoder encoding %d samples, got back %d bytes\n", 960, ret);
+		if (ret < 0) {
+			printf("Opus Encoder error: %s\n", opus_strerror (ret));	
+		}
 
-	buffer = vorbis_analysis_buffer (&s->vd, samples);
-
-	for (i = 0; i < samples; i++)
-		for (j = 0; j < channels; j++)
-			buffer[j][i] = buf[i*channels + j];
-
-	vorbis_analysis_wrote (&s->vd, samples);
+		s->sbuffer_pos -= bytes_per_opus_frame;
+		s->sbuffer_samples -= samples_per_opus_frame;
+		memmove (s->sbuffer, s->sbuffer + bytes_per_opus_frame, bytes_per_opus_frame);		
+	}
+	
+	if (ret > 0) {
+		s->op.b_o_s = 0;
+		s->op.e_o_s = 0;
+		s->op.granulepos = s->granulepos;
+		s->op.packetno = s->packetno++;
+		s->op.packet = s->buffer;
+		s->op.bytes = ret;
+		s->granulepos += samples_per_opus_frame;
+		ogg_stream_packetin (&s->os, &s->op);
+	}
+	
 	s->samples_in_current_page += samples;
 }
 
@@ -178,16 +373,15 @@ void xmms_ices_encoder_input (encoder_state *s, xmms_samplefloat_t *buf, int byt
  * mark the ogg stream as being in the flushing state. */
 void xmms_ices_encoder_finish (encoder_state *s)
 {
-	ogg_packet op;
 
-	vorbis_analysis_wrote (&s->vd, 0);
+	s->op.b_o_s = 0;
+	s->op.e_o_s = 1;
+	s->op.granulepos = s->granulepos;
+	s->op.packetno = s->packetno++;
+	s->op.packet = NULL;
+	s->op.bytes = 0;
 
-	while (vorbis_analysis_blockout (&s->vd, &s->vb)==1) {
-		vorbis_analysis (&s->vb, NULL);
-		vorbis_bitrate_addblock (&s->vb);
-		while (vorbis_bitrate_flushpacket (&s->vd, &op))
-			ogg_stream_packetin (&s->os, &op);
-	}
+	ogg_stream_packetin (&s->os, &s->op);
 
 	s->flushing = TRUE;
 }
@@ -197,8 +391,6 @@ void xmms_ices_encoder_finish (encoder_state *s)
  */
 gboolean xmms_ices_encoder_output (encoder_state *s, ogg_page *og)
 {
-	ogg_packet op;
-
 	/* As long as we're still in the header, we still have the header
 	 * packets to output. Loop over those before going to the actual
 	 * vorbis data. */
@@ -217,20 +409,10 @@ gboolean xmms_ices_encoder_output (encoder_state *s, ogg_page *og)
 			return FALSE;
 	}
 
-	/* Flush the vorbis analysis stream into ogg packets, and add
-	 * those to the ogg packet stream. */
-	while (vorbis_analysis_blockout (&s->vd, &s->vb) == 1) {
-		vorbis_analysis (&s->vb, NULL);
-		vorbis_bitrate_addblock (&s->vb);
-
-		while (vorbis_bitrate_flushpacket (&s->vd, &op))
-			ogg_stream_packetin (&s->os, &op);
-	}
-
 	/* For live encoding, we want to stream pages regularly, rather
 	 * than burst huge pages. Therefore, we periodically manually
 	 * flush the stream. */
-	if (s->samples_in_current_page > s->rate * 2) {
+	if (s->samples_in_current_page > 4096) {
 		if (!ogg_stream_flush (&s->os, og))
 			return FALSE;
 	} else {

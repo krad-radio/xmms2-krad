@@ -5,9 +5,9 @@ def plugin_configure(conf):
             uselib_store="shout")
     conf.check_cfg(package="ogg", args="--cflags --libs",
             uselib_store="ogg")
-    conf.check_cfg(package="vorbisenc", args="--cflags --libs",
-            uselib_store="vorbisenc")
+    conf.check_cfg(package="opus", args="--cflags --libs",
+            uselib_store="opus")
 
 configure, build = plugin('ices', configure=plugin_configure,
-                          libs=["shout", "vorbisenc", "ogg", "socket"],
+                          libs=["shout", "opus", "ogg", "socket"],
                           output_prio=10)

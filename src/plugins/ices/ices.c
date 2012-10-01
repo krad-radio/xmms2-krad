@@ -11,7 +11,7 @@
  */
 
 /**
- * @file Output plugin to stream Ogg Vorbis to an Icecast2 server.
+ * @file Output plugin to stream Ogg Opus to an Icecast2 or Krad Radio server.
  */
 
 #include "xmms/xmms_outputplugin.h"
@@ -25,13 +25,12 @@
 #include <shout/shout.h>
 
 #include <ogg/ogg.h>
-#include <vorbis/codec.h>
+#include <opus.h>
 
 #include "encode.h"
 
 typedef struct xmms_ices_data_St {
 	shout_t *shout;
-	vorbis_comment vc;
 	encoder_state *encoder;
 	gint rate;
 	gint channels;
@@ -46,14 +45,14 @@ static void xmms_ices_destroy (xmms_output_t *output);
 static gboolean xmms_ices_open (xmms_output_t *output);
 static void xmms_ices_close (xmms_output_t *output);
 static void xmms_ices_flush (xmms_output_t *output);
-static gboolean xmms_ices_format_set (xmms_output_t *output,
-                                      const xmms_stream_type_t *format);
+//static gboolean xmms_ices_format_set (xmms_output_t *output,
+//                                      const xmms_stream_type_t *format);
 static void xmms_ices_write (xmms_output_t *output, gpointer buffer,
                              gint len, xmms_error_t *err);
-static void xmms_ices_update_comment (xmms_medialib_entry_t entry,
-                                      vorbis_comment *vc);
-static void on_playlist_entry_changed (xmms_object_t *object, xmmsv_t *arg,
-                                       gpointer udata);
+//static void xmms_ices_update_comment (xmms_medialib_entry_t entry,
+//                                     vorbis_comment *vc);
+//static void on_playlist_entry_changed (xmms_object_t *object, xmmsv_t *arg,
+//                                       gpointer udata);
 
 /*
  * Internal helper functions.
@@ -107,14 +106,12 @@ xmms_ices_plugin_setup (xmms_output_plugin_t *plugin)
 		const char *name;
 		const char *val;
 	} *pptr, ices_properties[] = {
-		{ "encodingnombr", "96000" },
-		{ "encodingminbr", "-1" },
-		{ "encodingmaxbr", "-1" },
+		{ "bitrate", "128000" },
 		{ "host", "localhost" },
 		{ "port", "8000" },
 		{ "user", "source" },
 		{ "password", "hackme" },
-		{ "mount", "/stream.ogg" },
+		{ "mount", "/stream.opus" },
 		{ "public", "0" },
 		{ "streamname", "" },
 		{ "streamdescription", "" },
@@ -131,7 +128,7 @@ xmms_ices_plugin_setup (xmms_output_plugin_t *plugin)
 	methods.close = xmms_ices_close;
 
 	methods.flush = xmms_ices_flush;
-	methods.format_set = xmms_ices_format_set;
+	//methods.format_set = xmms_ices_format_set;
 	methods.write = xmms_ices_write;
 
 	xmms_output_plugin_methods_set (plugin, &methods);
@@ -155,7 +152,7 @@ xmms_ices_new (xmms_output_t *output)
 	data = g_new0 (xmms_ices_data_t, 1);
 	data->shout = shout_new ();
 
-	shout_set_format (data->shout, SHOUT_FORMAT_VORBIS);
+	shout_set_format (data->shout, SHOUT_FORMAT_OGG);
 	shout_set_protocol (data->shout, SHOUT_PROTOCOL_HTTP);
 
 	val = xmms_output_config_lookup (output, "host");
@@ -191,13 +188,13 @@ xmms_ices_new (xmms_output_t *output)
 	shout_set_url (data->shout, xmms_config_property_get_string (val));
 
 	xmms_output_private_data_set (output, data);
-	xmms_output_format_add (output, XMMS_SAMPLE_FORMAT_FLOAT, 2, 44100);
-
+	xmms_output_format_add (output, XMMS_SAMPLE_FORMAT_FLOAT, 2, 48000);
+	/*
 	xmms_object_connect (XMMS_OBJECT (output),
 	                     XMMS_IPC_SIGNAL_PLAYBACK_CURRENTID,
 	                     on_playlist_entry_changed,
 	                     data);
-
+	*/
 	return TRUE;
 }
 
@@ -209,15 +206,14 @@ xmms_ices_destroy (xmms_output_t *output)
 	data = xmms_output_private_data_get (output);
 	g_return_if_fail (data);
 
+	/*
 	xmms_object_disconnect (XMMS_OBJECT (output),
 	                        XMMS_IPC_SIGNAL_PLAYBACK_CURRENTID,
 	                        on_playlist_entry_changed,
 	                        data);
-
+	*/
 	if (data->encoder)
 		xmms_ices_encoder_fini (data->encoder);
-
-	vorbis_comment_clear (&data->vc);
 
 	shout_close (data->shout);
 	shout_free (data->shout);
@@ -231,6 +227,8 @@ static gboolean
 xmms_ices_open (xmms_output_t *output)
 {
 	xmms_ices_data_t *data;
+	xmms_config_property_t *val;
+	int bitrate;
 	g_return_val_if_fail (output, FALSE);
 	data = xmms_output_private_data_get (output);
 	g_return_val_if_fail (data, FALSE);
@@ -244,6 +242,15 @@ xmms_ices_open (xmms_output_t *output)
 		xmms_log_error ("Couldn't connect to icecast server!");
 		return FALSE;
 	}
+
+	val = xmms_output_config_lookup (output, "bitrate");
+	bitrate = xmms_config_property_get_int (val);
+
+	data->encoder = xmms_ices_encoder_init (bitrate);
+	if (!data->encoder)
+		return FALSE;
+
+	xmms_ices_encoder_create (data->encoder);
 
 	return TRUE;
 }
@@ -273,7 +280,7 @@ static void
 xmms_ices_flush (xmms_output_t *output)
 {
 }
-
+/*
 static gboolean
 xmms_ices_format_set (xmms_output_t *output, const xmms_stream_type_t *format)
 {
@@ -288,30 +295,26 @@ xmms_ices_format_set (xmms_output_t *output, const xmms_stream_type_t *format)
 	if (data->encoder)
 		xmms_ices_flush_internal (data);
 
-	/* Set the Vorbis comment to the current track metadata. */
-	vorbis_comment_clear (&data->vc);
-	vorbis_comment_init (&data->vc);
+	// Set the Vorbis comment to the current track metadata.
+	//vorbis_comment_clear (&data->vc);
+	//vorbis_comment_init (&data->vc);
 
-	entry = xmms_output_current_id (output);
-	xmms_ices_update_comment (entry, &data->vc);
+	//entry = xmms_output_current_id (output);
+	//xmms_ices_update_comment (entry, &data->vc);
 
-	/* If there is no encoder around, we need to build one. */
+	// If there is no encoder around, we need to build one.
 	if (!data->encoder) {
-		int minbr, nombr, maxbr;
+		int bitrate;
 
-		val = xmms_output_config_lookup (output, "encodingnombr");
-		nombr = xmms_config_property_get_int (val);
-		val = xmms_output_config_lookup (output, "encodingminbr");
-		minbr = xmms_config_property_get_int (val);
-		val = xmms_output_config_lookup (output, "encodingmaxbr");
-		maxbr = xmms_config_property_get_int (val);
+		val = xmms_output_config_lookup (output, "bitrate");
+		bitrate = xmms_config_property_get_int (val);
 
-		data->encoder = xmms_ices_encoder_init (minbr, nombr, maxbr);
+		data->encoder = xmms_ices_encoder_init (bitrate);
 		if (!data->encoder)
 			return FALSE;
 	}
 
-	/* Get this stream's data and fire up the encoder. */
+	// Get this stream's data and fire up the encoder.
 	data->rate = xmms_stream_type_get_int (format,
 	                                       XMMS_STREAM_TYPE_FMT_SAMPLERATE);
 	data->channels = xmms_stream_type_get_int (format,
@@ -326,7 +329,7 @@ xmms_ices_format_set (xmms_output_t *output, const xmms_stream_type_t *format)
 
 	return TRUE;
 }
-
+*/
 static void
 xmms_ices_write (xmms_output_t *output, gpointer buffer,
                  gint len, xmms_error_t *err)
@@ -345,7 +348,7 @@ xmms_ices_write (xmms_output_t *output, gpointer buffer,
 
 	xmms_ices_send_shout (data, err);
 }
-
+/*
 static void
 xmms_ices_update_comment (xmms_medialib_entry_t entry, vorbis_comment *vc)
 {
@@ -362,7 +365,7 @@ xmms_ices_update_comment (xmms_medialib_entry_t entry, vorbis_comment *vc)
 	vorbis_comment_clear (vc);
 	vorbis_comment_init (vc);
 
-	/* TODO: #2333
+	 TODO: #2333
 	for (pptr = props; pptr && pptr->prop; pptr++) {
 		const gchar *tmp;
 
@@ -371,7 +374,7 @@ xmms_ices_update_comment (xmms_medialib_entry_t entry, vorbis_comment *vc)
 			vorbis_comment_add_tag (vc, pptr->key, (gchar *) tmp);
 		}
 	}
-	*/
+	
 
 }
 
@@ -398,3 +401,4 @@ on_playlist_entry_changed (xmms_object_t *object, xmmsv_t *arg, gpointer udata)
 	                                 &data->vc);
 
 }
+*/
