@@ -1,0 +1,69 @@
+from waftools.plugin import plugin
+
+includedirs = """
+../../../../krad_radio/tools/krad_ee/
+../../../../krad_radio/tools/krad_compositor/
+../../../../krad_radio/tools/krad_ticker/
+../../../../krad_radio/tools/krad_xmms2/
+../../../../krad_radio/tools/krad_framepool/
+../../../../krad_radio/tools/krad_web/
+../../../../krad_radio/tools/krad_web/ext/
+../../../../krad_radio/tools/krad_web/res/
+../../../../krad_radio/tools/krad_sfx/
+../../../../krad_radio/tools/krad_tone/
+../../../../krad_radio/tools/krad_ipc/
+../../../../krad_radio/tools/krad_tags/
+../../../../krad_radio/tools/krad_audio/
+../../../../krad_radio/tools/krad_theora/
+../../../../krad_radio/tools/krad_jack/
+../../../../krad_radio/tools/krad_alsa/
+../../../../krad_radio/tools/krad_mixer/
+../../../../krad_radio/tools/krad_osc/
+../../../../krad_radio/tools/krad_xmms2/
+../../../../krad_radio/tools/krad_wayland/
+../../../../krad_radio/tools/krad_vpx/
+../../../../krad_radio/tools/krad_v4l2/
+../../../../krad_radio/tools/krad_flac/
+../../../../krad_radio/tools/krad_vorbis/
+../../../../krad_radio/tools/krad_gui/
+../../../../krad_radio/tools/krad_opus/
+../../../../krad_radio/tools/krad_radio/
+../../../../krad_radio/tools/krad_ring/
+../../../../krad_radio/tools/krad_ogg/
+../../../../krad_radio/tools/krad_io/
+../../../../krad_radio/tools/krad_link/
+../../../../krad_radio/tools/krad_transmitter/
+../../../../krad_radio/tools/krad_container/
+../../../../krad_radio/tools/krad_x11/
+../../../../krad_radio/tools/krad_udp/
+../../../../krad_radio/tools/krad_codec2/
+../../../../krad_radio/tools/krad_system/
+../../../../krad_radio/tools/krad_decklink/
+../../../../krad_radio/tools/krad_decklink/vendor
+../../../../krad_radio/tools/krad_ebml/
+/usr/include
+../../../_build_/
+""".split()
+
+depsources2 = """
+../../../../krad_radio/tools/krad_system/krad_system.c
+../../../../krad_radio/tools/krad_ebml/krad_ebml.c
+../../../../krad_radio/tools/krad_ring/krad_ring.c
+../../../../krad_radio/tools/krad_transmitter/krad_transmitter.c
+../../../../krad_radio/tools/krad_link/krad_link_common.c
+../../../../krad_radio/tools/krad_ipc/krad_ipc_client.c
+../../../../krad_radio/tools/krad_osc/krad_osc.c
+../../../../krad_radio/tools/krad_tone/krad_tone.c
+../../../../krad_radio/tools/krad_alsa/krad_alsa_seq.c
+""".split()
+
+def plugin_build(bld, obj):
+  obj.source += depsources2
+  obj.includes = [obj.includes] + includedirs
+
+def plugin_configure(conf):
+	conf.check_cfg(package="opus", uselib_store="opus", args="--cflags --libs")
+	conf.check_cfg(package="alsa", uselib_store="alsa", args="--cflags --libs")
+  
+configure, build = plugin("krad", configure=plugin_configure, build=plugin_build,
+                          libs=["opus","alsa"], output_prio=30)
